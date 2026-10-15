@@ -1,0 +1,1001 @@
+package server
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+
+	// Registers pprof handlers on http.DefaultServeMux, served by startPprofServer.
+	_ "net/http/pprof"
+	"os"
+	"os/signal"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/google/uuid"
+	log "github.com/sirupsen/logrus"
+	"github.com/superplanehq/superplane/ee/rbac"
+	"github.com/superplanehq/superplane/pkg/agents"
+	agenttools "github.com/superplanehq/superplane/pkg/agents/agent_tools"
+	"github.com/superplanehq/superplane/pkg/agents/anthropic"
+	"github.com/superplanehq/superplane/pkg/authorization"
+	"github.com/superplanehq/superplane/pkg/bitbucketapp"
+	"github.com/superplanehq/superplane/pkg/blob"
+	blobazure "github.com/superplanehq/superplane/pkg/blob/azure"
+	blobfilesystem "github.com/superplanehq/superplane/pkg/blob/filesystem"
+	"github.com/superplanehq/superplane/pkg/blob/gcs"
+	s3blob "github.com/superplanehq/superplane/pkg/blob/s3"
+	"github.com/superplanehq/superplane/pkg/config"
+	"github.com/superplanehq/superplane/pkg/crypto"
+	"github.com/superplanehq/superplane/pkg/database"
+	"github.com/superplanehq/superplane/pkg/enterprise"
+	"github.com/superplanehq/superplane/pkg/githubapp"
+	grpc "github.com/superplanehq/superplane/pkg/grpc"
+	agentsActions "github.com/superplanehq/superplane/pkg/grpc/actions/agents"
+	"github.com/superplanehq/superplane/pkg/jwt"
+	"github.com/superplanehq/superplane/pkg/licensing"
+	"github.com/superplanehq/superplane/pkg/llm"
+	"github.com/superplanehq/superplane/pkg/logging"
+	"github.com/superplanehq/superplane/pkg/models"
+	"github.com/superplanehq/superplane/pkg/networkpolicy"
+	"github.com/superplanehq/superplane/pkg/oidc"
+	"github.com/superplanehq/superplane/pkg/public"
+	"github.com/superplanehq/superplane/pkg/public/runnerapi"
+	registry "github.com/superplanehq/superplane/pkg/registry"
+	"github.com/superplanehq/superplane/pkg/registryimports"
+	runnerlogs "github.com/superplanehq/superplane/pkg/runners/logs"
+	runnerlogsfs "github.com/superplanehq/superplane/pkg/runners/logs/fs"
+	"github.com/superplanehq/superplane/pkg/services"
+	"github.com/superplanehq/superplane/pkg/telemetry"
+	"github.com/superplanehq/superplane/pkg/workers"
+	"go.opentelemetry.io/otel"
+	"gorm.io/gorm"
+)
+
+var _ = registryimports.Loaded
+
+var agentProviderOverride = struct {
+	sync.Mutex
+	provider agents.Provider
+}{}
+
+func SetAgentProviderForTests(provider agents.Provider) func() {
+	agentProviderOverride.Lock()
+	previous := agentProviderOverride.provider
+	agentProviderOverride.provider = provider
+	agentProviderOverride.Unlock()
+
+	return func() {
+		agentProviderOverride.Lock()
+		agentProviderOverride.provider = previous
+		agentProviderOverride.Unlock()
+	}
+}
+
+func getAgentProviderOverride() agents.Provider {
+	agentProviderOverride.Lock()
+	defer agentProviderOverride.Unlock()
+	return agentProviderOverride.provider
+}
+
+var licenseServiceOverride = struct {
+	sync.Mutex
+	service *licensing.Service
+}{}
+
+// SetLicenseServiceForTests replaces the license service that Start creates.
+// End-to-end tests use it with licenses signed by ephemeral test keys.
+func SetLicenseServiceForTests(service *licensing.Service) func() {
+	licenseServiceOverride.Lock()
+	previous := licenseServiceOverride.service
+	licenseServiceOverride.service = service
+	licenseServiceOverride.Unlock()
+
+	return func() {
+		licenseServiceOverride.Lock()
+		licenseServiceOverride.service = previous
+		licenseServiceOverride.Unlock()
+	}
+}
+
+func getLicenseServiceOverride() *licensing.Service {
+	licenseServiceOverride.Lock()
+	defer licenseServiceOverride.Unlock()
+	return licenseServiceOverride.service
+}
+
+func buildAgentService(authService authorization.Authorization) (agents.Provider, agentsActions.AgentsService) {
+	if provider := getAgentProviderOverride(); provider != nil {
+		log.WithField("provider", provider.Name()).Info("Managed agents enabled with provider override")
+		return provider, agents.NewService(provider, authService)
+	}
+
+	cfg := config.LoadAnthropicAgentConfig()
+	if !cfg.Enabled() {
+		log.Info("Anthropic managed agents disabled: missing ANTHROPIC_* env vars")
+		return nil, nil
+	}
+
+	if err := anthropic.SyncDefaultAgentPrompt(context.Background(), anthropic.Config{
+		APIKey:        cfg.APIKey,
+		AgentID:       cfg.AgentID,
+		EnvironmentID: cfg.EnvironmentID,
+	}); err != nil {
+		log.WithError(err).Warn("failed to sync Anthropic managed agent prompt; continuing with provider prompt")
+	} else {
+		log.Info("Anthropic managed agent prompt synced")
+	}
+
+	fileResources, err := anthropic.LoadDefaultSessionResources(context.Background(), anthropic.Config{
+		APIKey:        cfg.APIKey,
+		AgentID:       cfg.AgentID,
+		EnvironmentID: cfg.EnvironmentID,
+	})
+	if err != nil {
+		log.WithError(err).Warn("failed to load Anthropic session resources; continuing without mounted references")
+		fileResources = nil
+	}
+
+	provider, err := anthropic.New(anthropic.Config{
+		APIKey:        cfg.APIKey,
+		AgentID:       cfg.AgentID,
+		EnvironmentID: cfg.EnvironmentID,
+		Resources:     fileResources,
+	})
+	if err != nil {
+		log.WithError(err).Warn("failed to initialise Anthropic managed agents provider")
+		return nil, nil
+	}
+
+	service := agents.NewService(provider, authService)
+	log.Info("Anthropic managed agents enabled")
+	return provider, service
+}
+
+// Cloud has the GitHub App in the process environment at boot. A self-hosted
+// installation stores the app after the first workspace setup, so this waits
+// until that app exists and then starts the catalog worker.
+func startGitHubAppCatalogWorker(ctx context.Context) {
+	loggedWait := false
+	for {
+		cfg, err := githubapp.ResolveProcess(ctx)
+		switch {
+		case err != nil:
+			log.WithError(err).Error("Failed to load the GitHub App for the catalog")
+		case cfg.Enabled():
+			catalog, catalogErr := githubapp.NewCatalog(database.Conn(), cfg)
+			if catalogErr != nil {
+				log.WithError(catalogErr).Error("Failed to initialize the GitHub App catalog")
+				break
+			}
+			log.Println("Starting GitHub App Catalog Worker")
+			workers.NewVCSProviderCatalogWorker(models.ProviderGitHub, catalog).Start(ctx)
+			return
+		case !loggedWait:
+			log.Println("GitHub App catalog waits until the app is configured")
+			loggedWait = true
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(15 * time.Second):
+		}
+	}
+}
+
+func startWorkers(
+	encryptor crypto.Encryptor,
+	registry *registry.Registry,
+	oidcProvider oidc.Provider,
+	baseURL string,
+	authService authorization.Authorization,
+	agentProvider agents.Provider,
+) {
+	log.Println("Starting Workers")
+
+	if os.Getenv("START_RUNNER_LOG_COMPACTOR") == "yes" {
+		log.Println("Starting Runner Task Log Compactor")
+		installationID, err := models.GetInstallationID(database.Conn())
+		if err != nil {
+			panic(fmt.Sprintf("failed to load installation ID: %v", err))
+		}
+		activeStore := runnerlogs.Current()
+		if activeStore == nil {
+			panic("runner task log compactor requires RUNNER_ACTIVE_LOG_FS_PATH")
+		}
+		w := workers.NewRunnerTaskLogCompactor(
+			blob.Current(),
+			activeStore,
+			installationID,
+			5*time.Second,
+			time.Minute,
+		)
+		go w.Start(context.Background())
+	}
+
+	if os.Getenv("START_RUNNER_CLEANUP_WORKER") == "yes" {
+		log.Println("Starting Runner Cleanup Worker")
+		w := workers.NewRunnerCleanupWorker(5 * time.Second)
+		go w.Start(context.Background())
+	}
+
+	if os.Getenv("START_REGULAR_WORKERS") == "no" {
+		return
+	}
+
+	rabbitMQURL, err := config.RabbitMQURL()
+	if err != nil {
+		panic(err)
+	}
+
+	go startGitHubAppCatalogWorker(context.Background())
+
+	if os.Getenv("START_CONSUMERS") == "yes" {
+		startEmailConsumers(rabbitMQURL, encryptor, baseURL)
+		startFactorySentryResolveConsumer(rabbitMQURL, encryptor, registry)
+		startFactoryJiraCloseConsumer(rabbitMQURL, encryptor, registry, baseURL)
+	}
+
+	if os.Getenv("START_WORKFLOW_EVENT_ROUTER") == "yes" || os.Getenv("START_EVENT_ROUTER") == "yes" {
+		log.Println("Starting Event Router")
+
+		w := workers.NewEventRouter(rabbitMQURL)
+		go w.Start(context.Background())
+	}
+
+	if os.Getenv("START_RUN_FINALIZER") == "yes" {
+		log.Println("Starting Run Finalizer")
+
+		w := workers.NewRunFinalizer(rabbitMQURL, registry).WithEncryptor(encryptor)
+		go w.Start(context.Background())
+	}
+
+	if os.Getenv("START_WORKFLOW_NODE_EXECUTOR") == "yes" || os.Getenv("START_NODE_EXECUTOR") == "yes" {
+		log.Println("Starting Node Executor")
+
+		webhookBaseURL := getWebhookBaseURL(baseURL)
+		w := workers.NewNodeExecutor(encryptor, registry, oidcProvider, baseURL, webhookBaseURL, rabbitMQURL, authService)
+		go w.Start(context.Background())
+	}
+
+	if os.Getenv("START_EXECUTION_TERMINATOR") == "yes" {
+		log.Println("Starting Execution Terminator")
+
+		w := workers.NewExecutionTerminator(rabbitMQURL, authService, encryptor, registry)
+		go w.Start(context.Background())
+	}
+
+	if os.Getenv("START_NODE_REQUEST_WORKER") == "yes" {
+		log.Println("Starting Node Request Worker")
+
+		webhookBaseURL := getWebhookBaseURL(baseURL)
+		w := workers.NewNodeRequestWorker(encryptor, registry, webhookBaseURL, authService)
+		go w.Start(context.Background())
+	}
+
+	if os.Getenv("START_APP_MESSAGE_WORKER") == "yes" {
+		log.Println("Starting App Message Worker")
+
+		w := workers.NewAppMessageWorker(registry)
+		go w.Start(context.Background())
+	}
+
+	if os.Getenv("START_RUN_INITIALIZER") == "yes" {
+		log.Println("Starting Run Initializer")
+		w := workers.NewRunInitializer(rabbitMQURL, registry)
+		go w.Start(context.Background())
+	}
+
+	if os.Getenv("START_APP_INSTALLATION_REQUEST_WORKER") == "yes" || os.Getenv("START_INTEGRATION_REQUEST_WORKER") == "yes" {
+		log.Println("Starting Integration Request Worker")
+
+		webhooksBaseURL := getWebhookBaseURL(baseURL)
+		w := workers.NewIntegrationRequestWorker(encryptor, registry, oidcProvider, baseURL, webhooksBaseURL)
+		go w.Start(context.Background())
+	}
+
+	if os.Getenv("START_WORKFLOW_NODE_QUEUE_WORKER") == "yes" || os.Getenv("START_NODE_QUEUE_WORKER") == "yes" {
+		log.Println("Starting Node Queue Worker")
+
+		w := workers.NewNodeQueueWorker(registry, rabbitMQURL)
+		go w.Start(context.Background())
+	}
+
+	// Start Webhook Provisioner when internal API runs so integration webhooks (e.g. GCP On VM Created) get provisioned.
+	// Can be disabled by setting START_WEBHOOK_PROVISIONER=no.
+	if os.Getenv("START_WEBHOOK_PROVISIONER") != "no" {
+		if os.Getenv("START_WEBHOOK_PROVISIONER") == "yes" {
+			log.Println("Starting Webhook Provisioner")
+		}
+		webhookBaseURL := getWebhookBaseURL(baseURL)
+		w := workers.NewWebhookProvisioner(webhookBaseURL, encryptor, registry)
+		go w.Start(context.Background())
+	}
+
+	if os.Getenv("START_WEBHOOK_CLEANUP_WORKER") == "yes" {
+		log.Println("Starting Webhook Cleanup Worker")
+
+		w := workers.NewWebhookCleanupWorker(encryptor, registry, baseURL)
+		go w.Start(context.Background())
+	}
+
+	if os.Getenv("START_INSTALLATION_CLEANUP_WORKER") == "yes" || os.Getenv("START_INTEGRATION_CLEANUP_WORKER") == "yes" {
+		log.Println("Starting Integration Cleanup Worker")
+
+		w := workers.NewIntegrationCleanupWorker(registry, encryptor, baseURL)
+		go w.Start(context.Background())
+	}
+
+	if os.Getenv("START_WORKFLOW_CLEANUP_WORKER") == "yes" || os.Getenv("START_CANVAS_CLEANUP_WORKER") == "yes" {
+		log.Println("Starting Canvas Cleanup Worker")
+
+		w := workers.NewCanvasCleanupWorker(agentProvider)
+		go w.Start(context.Background())
+	}
+
+	if os.Getenv("START_NODE_REQUEST_CLEANUP_WORKER") == "yes" {
+		log.Println("Starting Node Request Cleanup Worker")
+
+		w := workers.NewNodeRequestCleanupWorker()
+		go w.Start(context.Background())
+	}
+
+	if os.Getenv("START_ORGANIZATION_CLEANUP_WORKER") == "yes" {
+		log.Println("Starting Organization Cleanup Worker")
+
+		w := workers.NewOrganizationCleanupWorker(agentProvider)
+		go w.Start(context.Background())
+	}
+
+	if os.Getenv("START_FACTORY_CLEANUP_WORKER") == "yes" {
+		log.Println("Starting Factory Cleanup Worker")
+
+		w := workers.NewFactoryCleanupWorker()
+		go w.Start(context.Background())
+	}
+
+	if os.Getenv("START_FILE_CLEANUP_WORKER") == "yes" {
+		log.Println("Starting File Cleanup Worker")
+
+		w := workers.NewFileCleanupWorker()
+		go w.Start(context.Background())
+	}
+
+	if os.Getenv("START_FACTORY_VELOCITY_SYNC_WORKER") == "yes" {
+		log.Println("Starting Factory Velocity Sync Worker")
+
+		w := workers.NewFactoryVelocitySyncWorker(rabbitMQURL, encryptor, registry)
+		go w.Start(context.Background())
+	}
+
+	if os.Getenv("START_PRICE_BOOK_SYNC_WORKER") == "yes" {
+		log.Println("Starting Price Book Sync Worker")
+
+		w := workers.NewPriceBookSyncWorker(encryptor, registry)
+		go w.Start(context.Background())
+	}
+
+	if os.Getenv("START_PLANNING_SESSION_CLEANUP_WORKER") == "yes" {
+		log.Println("Starting Planning Session Cleanup Worker")
+
+		w := workers.NewPlanningSessionCleanupWorker()
+		go w.Start(context.Background())
+	}
+
+	if os.Getenv("START_EVENT_RETENTION_WORKER") == "yes" {
+		log.Println("Starting Event Retention Worker")
+		w := workers.NewEventRetentionWorker()
+		go w.Start(context.Background())
+	}
+
+	if agentProvider != nil && os.Getenv("START_AGENT_STREAM_WORKER") != "no" {
+		log.Println("Starting Agent Stream Worker")
+		agentToolRegistry := agenttools.NewRegistry(agenttools.Dependencies{
+			Encryptor:         encryptor,
+			ComponentRegistry: registry,
+			WebhookBaseURL:    getWebhookBaseURL(baseURL),
+			AuthService:       authService,
+		})
+		w := workers.NewAgentStreamWorker(
+			agentProvider,
+			rabbitMQURL,
+			agentToolRegistry,
+		)
+		go w.Start(context.Background())
+	}
+
+}
+
+func startEmailConsumers(rabbitMQURL string, encryptor crypto.Encryptor, baseURL string) {
+	emailService := services.BuildEmailService(encryptor, services.EmailServiceConfig{
+		TemplateDir:       os.Getenv("TEMPLATE_DIR"),
+		OwnerSetupEnabled: os.Getenv("OWNER_SETUP_ENABLED") == "yes",
+		ResendAPIKey:      os.Getenv("RESEND_API_KEY"),
+		FromName:          os.Getenv("EMAIL_FROM_NAME"),
+		FromEmail:         os.Getenv("EMAIL_FROM_ADDRESS"),
+	})
+	discord := services.NewDiscordWebhookClient(os.Getenv("DISCORD_FEEDBACK_WEBHOOK_URL"))
+
+	if emailService == nil && !discord.Enabled() {
+		log.Warn("Email Consumers not started - missing required environment variables")
+		return
+	}
+
+	startEmailConsumersWithService(rabbitMQURL, emailService, discord, baseURL)
+}
+
+func startEmailConsumersWithService(
+	rabbitMQURL string,
+	emailService services.EmailService,
+	discord *services.DiscordWebhookClient,
+	baseURL string,
+) {
+	if emailService != nil {
+		log.Println("Starting Magic Code Email Consumer")
+		magicCodeEmailConsumer := workers.NewMagicCodeEmailConsumer(rabbitMQURL, emailService, baseURL)
+		go magicCodeEmailConsumer.Start()
+
+		log.Println("Starting Factory Notification Consumer")
+		factoryNotificationConsumer := workers.NewFactoryNotificationConsumer(rabbitMQURL, emailService, baseURL)
+		go factoryNotificationConsumer.Start()
+	}
+
+	log.Println("Starting Support Feedback Consumer")
+	supportFeedbackConsumer := workers.NewSupportFeedbackConsumer(rabbitMQURL, emailService, discord)
+	go supportFeedbackConsumer.Start()
+}
+
+func startFactorySentryResolveConsumer(
+	rabbitMQURL string,
+	encryptor crypto.Encryptor,
+	componentRegistry *registry.Registry,
+) {
+	log.Println("Starting Factory Sentry Resolve Consumer")
+	consumer := workers.NewFactorySentryResolveConsumer(rabbitMQURL, encryptor, componentRegistry)
+	go consumer.Start()
+}
+
+func startFactoryJiraCloseConsumer(
+	rabbitMQURL string,
+	encryptor crypto.Encryptor,
+	componentRegistry *registry.Registry,
+	baseURL string,
+) {
+	log.Println("Starting Factory Jira Close Consumer")
+	consumer := workers.NewFactoryJiraCloseConsumer(rabbitMQURL, encryptor, componentRegistry, baseURL)
+	go consumer.Start()
+}
+
+func buildGRPCServices(
+	baseURL, webhooksBaseURL, runnerAPIBaseURL string,
+	encryptor crypto.Encryptor,
+	authService authorization.Authorization,
+	registry *registry.Registry,
+	oidcProvider oidc.Provider,
+	agentService agentsActions.AgentsService,
+	jwtSigner *jwt.Signer,
+	licenseService *licensing.Service,
+) (*grpc.Services, error) {
+	features := enterprise.NewRegistry()
+	features.Register(enterprise.RBAC, rbac.NewService(authService, licenseService))
+
+	return grpc.NewServices(grpc.ServicesConfig{
+		BaseURL:          baseURL,
+		WebhooksBaseURL:  webhooksBaseURL,
+		RunnerAPIBaseURL: runnerAPIBaseURL,
+		Encryptor:        encryptor,
+		AuthService:      authService,
+		Registry:         registry,
+		OIDCProvider:     oidcProvider,
+		AgentService:     agentService,
+		JWTSigner:        jwtSigner,
+		Entitlements:     licenseService,
+		Enterprise:       features,
+	})
+}
+
+func startRunnerAPI(jwtSigner *jwt.Signer, encryptor crypto.Encryptor, activeLogStoreName string) {
+	server, err := runnerapi.NewServer(jwtSigner, encryptor, activeLogStoreName)
+	if err != nil {
+		log.Fatalf("failed to create runner API server: %v", err)
+	}
+
+	address := fmt.Sprintf("0.0.0.0:%d", lookupPublicAPIPort())
+	log.Printf("Starting Runner API on %s", address)
+	notificationsCtx, stopNotifications := context.WithCancel(context.Background())
+	defer stopNotifications()
+	server.StartControlNotifications(notificationsCtx, uuid.NewString())
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(address) }()
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			log.Fatal(err)
+		}
+	case <-signals:
+		stopNotifications()
+		shutdownRunnerAPI(server)
+		os.Exit(0)
+	}
+}
+
+func registerRunnerAPI(
+	publicServer *public.Server,
+	jwtSigner *jwt.Signer,
+	encryptor crypto.Encryptor,
+	activeLogStoreName string,
+) {
+	server, err := runnerapi.NewServer(jwtSigner, encryptor, activeLogStoreName)
+	if err != nil {
+		log.Fatalf("failed to create integrated runner API server: %v", err)
+	}
+
+	publicServer.Router.PathPrefix("/runner/v1").Handler(server.Handler())
+	notificationsCtx, stopNotifications := context.WithCancel(context.Background())
+	server.StartControlNotifications(notificationsCtx, uuid.NewString())
+
+	go func() {
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
+		defer signal.Stop(signals)
+		<-signals
+		stopNotifications()
+		shutdownRunnerAPI(server)
+		os.Exit(0)
+	}()
+}
+
+func shutdownRunnerAPI(server *runnerapi.Server) {
+	if server.ConnectionCount() == 0 {
+		log.Println("Stopping Runner API")
+	} else {
+		log.Println("Stopping Runner API and reconnecting runners")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("Runner API graceful shutdown failed: %v", err)
+	}
+}
+
+func startPublicAPI(
+	baseURL, basePath string,
+	encryptor crypto.Encryptor,
+	registry *registry.Registry,
+	jwtSigner *jwt.Signer,
+	oidcProvider oidc.Provider,
+	authService authorization.Authorization,
+	licenseService *licensing.Service,
+	grpcServices *grpc.Services,
+	activeLogStoreName string,
+) {
+	log.Println("Starting Public API with integrated Web Server")
+
+	appEnv := os.Getenv("APP_ENV")
+	templateDir := os.Getenv("TEMPLATE_DIR")
+	blockSignup := os.Getenv("BLOCK_SIGNUP") == "yes"
+
+	webhooksBaseURL := getWebhookBaseURL(baseURL)
+	server, err := public.NewServer(
+		encryptor,
+		registry,
+		jwtSigner,
+		oidcProvider,
+		basePath,
+		baseURL,
+		webhooksBaseURL,
+		appEnv,
+		templateDir,
+		authService,
+		blockSignup,
+	)
+	if err != nil {
+		log.Panicf("Error creating public API server: %v", err)
+	}
+
+	server.SetLicenseService(licenseService)
+
+	// Start the EventDistributer worker if enabled
+	if os.Getenv("START_EVENT_DISTRIBUTER") == "yes" {
+		log.Println("Starting Event Distributer Worker")
+		eventDistributer := workers.NewEventDistributer(server.WebsocketHub())
+		go eventDistributer.Start()
+	} else {
+		log.Println("Event Distributer not started (START_EVENT_DISTRIBUTER != yes)")
+	}
+
+	if shouldRegisterGRPCGateway() {
+		log.Println("Registering gRPC gateway handlers on Public API")
+		err = server.RegisterGRPCGateway(grpcServices)
+		if err != nil {
+			log.Fatalf("Failed to register gRPC gateway: %v", err)
+		}
+		server.RegisterOpenAPIHandler()
+	} else {
+		log.Println("gRPC gateway not registered (START_GRPC_GATEWAY=no)")
+	}
+
+	if shouldRegisterWebSocketRoutes() {
+		log.Println("Registering websocket routes on Public API")
+		server.RegisterWebSocketRoutes()
+	} else {
+		log.Println("Websocket routes not registered")
+	}
+
+	if os.Getenv("START_RUNNER_API") == "yes" {
+		log.Println("Registering Runner API routes on Public API")
+		registerRunnerAPI(server, jwtSigner, encryptor, activeLogStoreName)
+	}
+
+	// Register web routes only if START_WEB_SERVER is set to "yes"
+	if os.Getenv("START_WEB_SERVER") == "yes" {
+		webBasePath := os.Getenv("WEB_BASE_PATH")
+		log.Printf("Registering web routes in public API server with base path: %s", webBasePath)
+		server.RegisterWebRoutes(webBasePath)
+	} else {
+		log.Println("Web server routes not registered (START_WEB_SERVER != yes)")
+	}
+
+	err = server.Serve("0.0.0.0", lookupPublicAPIPort())
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+// shouldRegisterWebSocketRoutes decides whether /ws routes are mounted.
+// START_WEBSOCKET_SERVER=yes|no is explicit; unset keeps single-process
+// compat by following START_WEB_SERVER.
+func shouldRegisterWebSocketRoutes() bool {
+	switch os.Getenv("START_WEBSOCKET_SERVER") {
+	case "yes":
+		return true
+	case "no":
+		return false
+	default:
+		return os.Getenv("START_WEB_SERVER") == "yes"
+	}
+}
+
+// shouldRegisterGRPCGateway registers the REST gateway unless explicitly disabled.
+// Unset defaults to on so existing deployments keep current behavior.
+func shouldRegisterGRPCGateway() bool {
+	return os.Getenv("START_GRPC_GATEWAY") != "no"
+}
+
+func lookupPublicAPIPort() int {
+	port := 8000
+
+	if p := os.Getenv("PUBLIC_API_PORT"); p != "" {
+		if v, errConv := strconv.Atoi(p); errConv == nil && v > 0 {
+			port = v
+		} else {
+			log.Warnf("Invalid PUBLIC_API_PORT %q, falling back to 8000", p)
+		}
+	}
+
+	return port
+}
+
+func configureLogging() {
+	logging.ConfigureProcessLogger()
+}
+
+func setupOtel() {
+	if os.Getenv("OTEL_ENABLED") != "yes" {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := telemetry.InitMetrics(ctx); err != nil {
+		log.Warnf("Failed to initialize OpenTelemetry metrics: %v", err)
+	} else {
+		log.Info("OpenTelemetry metrics initialized")
+	}
+
+	if err := telemetry.InitTracing(ctx); err != nil {
+		log.Warnf("Failed to initialize OpenTelemetry tracing: %v", err)
+	} else {
+		log.Info("OpenTelemetry tracing initialized for critical API endpoints")
+	}
+}
+
+func startPprofServer() {
+	if os.Getenv("PPROF_ENABLED") != "yes" {
+		return
+	}
+
+	port := os.Getenv("PPROF_PORT")
+	if port == "" {
+		port = "6060"
+	}
+
+	// Sample contention so /debug/pprof/block and /debug/pprof/mutex are useful.
+	runtime.SetBlockProfileRate(1)
+	runtime.SetMutexProfileFraction(5)
+
+	go func() {
+		log.Infof("pprof server listening on :%s", port)
+		if err := http.ListenAndServe("0.0.0.0:"+port, nil); err != nil {
+			log.Warnf("pprof server stopped: %v", err)
+		}
+	}()
+}
+
+func Start() {
+	configureLogging()
+	setupOtel()
+	startPprofServer()
+
+	telemetry.InitSentry()
+	telemetry.StartBeacon()
+
+	if err := models.LoadCurrentPriceBook(database.Conn()); err != nil {
+		log.WithError(err).Warn("failed to load usage price book; using in-memory rates")
+	}
+
+	encryptionKey := os.Getenv("ENCRYPTION_KEY")
+	if encryptionKey == "" {
+		panic("ENCRYPTION_KEY can't be empty")
+	}
+
+	log.SetLevel(log.DebugLevel)
+
+	var encryptorInstance crypto.Encryptor
+	if os.Getenv("NO_ENCRYPTION") == "yes" {
+		log.Warn("NO_ENCRYPTION is set to yes, using NoOpEncryptor")
+		encryptorInstance = crypto.NewNoOpEncryptor()
+	} else {
+		encryptorInstance = crypto.NewAESGCMEncryptor([]byte(encryptionKey))
+	}
+
+	bitbucketapp.SetSystemTokenSource(func(installationID string) (string, time.Time, error) {
+		return bitbucketapp.LoadSystemToken(context.Background(), database.Conn(), encryptorInstance, installationID, time.Now())
+	})
+
+	if err := llm.SeedDevHostedOpenRouterFromEnv(context.Background(), database.Conn(), encryptorInstance); err != nil {
+		log.WithError(err).Error("development hosted OpenRouter seed skipped")
+	}
+
+	licenseService := startLicenseService(encryptorInstance)
+
+	authService, err := authorization.NewAuthService()
+	if err != nil {
+		log.Fatalf("failed to create auth service: %v", err)
+	}
+
+	baseURL := os.Getenv("BASE_URL")
+	if baseURL == "" {
+		panic("BASE_URL must be set")
+	}
+
+	basePath := os.Getenv("PUBLIC_API_BASE_PATH")
+	if basePath == "" {
+		panic("PUBLIC_API_BASE_PATH must be set")
+	}
+
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		panic("JWT_SECRET must be set")
+	}
+
+	oidcKeysPath := os.Getenv("OIDC_KEYS_PATH")
+	if oidcKeysPath == "" {
+		panic("OIDC_KEYS_PATH must be set")
+	}
+
+	jwtSigner := jwt.NewSigner(jwtSecret)
+	webhooksBaseURL := getWebhookBaseURL(baseURL)
+	runnerAPIBaseURL := getRunnerAPIBaseURL(baseURL)
+	oidcProvider, err := oidc.NewProviderFromKeyDir(webhooksBaseURL, oidcKeysPath)
+	if err != nil {
+		panic(fmt.Sprintf("failed to load OIDC keys: %v", err))
+	}
+
+	log.Println("Creating blob storage provider")
+	blobProvider, err := newBlobProvider()
+	if err != nil {
+		panic(fmt.Sprintf("failed to create blob storage provider: %v", err))
+	}
+	blob.SetCurrent(blobProvider)
+
+	activeLogStore, err := newRunnerActiveLogStore()
+	if err != nil {
+		panic(fmt.Sprintf("failed to create runner active log store: %v", err))
+	}
+	if activeLogStore != nil {
+		setupContext := context.Background()
+		if err := activeLogStore.Setup(runnerlogs.SetupContext{
+			Context:       setupContext,
+			MeterProvider: otel.GetMeterProvider(),
+		}); err != nil {
+			panic(fmt.Sprintf("failed to set up runner active log store: %v", err))
+		}
+		runnerlogs.SetCurrent(activeLogStore)
+	}
+	activeLogStoreName := ""
+	if activeLogStore != nil {
+		activeLogStoreName = activeLogStore.Name()
+	}
+
+	registry, err := registry.NewRegistryWithOptions(registry.RegistryOptions{
+		Encryptor: encryptorInstance,
+		HTTP: registry.HTTPOptions{
+			MaxResponseBytes: DefaultMaxHTTPResponseBytes,
+			PolicyResolver: func() (registry.HTTPPolicy, error) {
+				policy, err := networkpolicy.ResolveHTTPPolicy()
+				if err != nil {
+					return registry.HTTPPolicy{}, err
+				}
+
+				return registry.HTTPPolicy{
+					BlockedHosts:    policy.BlockedHosts,
+					PrivateIPRanges: policy.PrivateIPRanges,
+				}, nil
+			},
+			PolicyResolverInTransaction: func(tx *gorm.DB) (registry.HTTPPolicy, error) {
+				policy, err := networkpolicy.ResolveHTTPPolicyInTransaction(tx)
+				if err != nil {
+					return registry.HTTPPolicy{}, err
+				}
+
+				return registry.HTTPPolicy{
+					BlockedHosts:    policy.BlockedHosts,
+					PrivateIPRanges: policy.PrivateIPRanges,
+				}, nil
+			},
+			PolicyCacheTTL: 5 * time.Second,
+		},
+	})
+
+	if err != nil {
+		panic(fmt.Sprintf("failed to create registry: %v", err))
+	}
+
+	agentProvider, agentService := buildAgentService(authService)
+
+	var grpcServices *grpc.Services
+	if os.Getenv("START_PUBLIC_API") == "yes" {
+		services, err := buildGRPCServices(
+			baseURL,
+			webhooksBaseURL,
+			runnerAPIBaseURL,
+			encryptorInstance,
+			authService,
+			registry,
+			oidcProvider,
+			agentService,
+			jwtSigner,
+			licenseService,
+		)
+		if err != nil {
+			log.Fatalf("failed to build gRPC services: %v", err)
+		}
+		grpcServices = services
+
+		go startPublicAPI(
+			baseURL,
+			basePath,
+			encryptorInstance,
+			registry,
+			jwtSigner,
+			oidcProvider,
+			authService,
+			licenseService,
+			grpcServices,
+			activeLogStoreName,
+		)
+	} else if os.Getenv("START_RUNNER_API") == "yes" {
+		go startRunnerAPI(jwtSigner, encryptorInstance, activeLogStoreName)
+	}
+
+	startWorkers(
+		encryptorInstance,
+		registry,
+		oidcProvider,
+		baseURL,
+		authService,
+		agentProvider,
+	)
+
+	log.Println("SuperPlane is UP.")
+
+	select {}
+}
+
+func startLicenseService(encryptor crypto.Encryptor) *licensing.Service {
+	if override := getLicenseServiceOverride(); override != nil {
+		return override
+	}
+
+	extraKeys, source := developmentLicense(licensing.SourceFromEnvironment(encryptor))
+	keys, err := licensing.TrustedKeyStore(extraKeys)
+	if err != nil {
+		panic(fmt.Sprintf("failed to load trusted license keys: %v", err))
+	}
+
+	keysURL, err := licensing.KeysURLFromEnvironment()
+	if err != nil {
+		panic(fmt.Sprintf("failed to configure license key sync: %v", err))
+	}
+
+	keySync := licensing.NewKeySync(keys, licensing.DatabaseKeyListCache{}, keysURL)
+	revocations := licensing.NewRevocationSync(keys.Roots(), licensing.DatabaseRevocationListCache{}, licensing.RevocationsURL(keysURL))
+	service := licensing.NewService(
+		licensing.NewVerifier(keys),
+		source,
+		licensing.WithKeySync(keySync),
+		licensing.WithRevocationSync(revocations),
+	)
+	service.Start(context.Background())
+	return service
+}
+
+// getWebhookBaseURL returns the webhook base URL, using the same pattern as SyncContext.
+// Use WEBHOOKS_BASE_URL if set, otherwise fall back to baseURL.
+// This allows e2e tests to use a fake/mock webhook URL, and local installations to use a different
+// URL for webhooks (e.g., a tunnel URL) when the base app is running on localhost.
+func getWebhookBaseURL(baseURL string) string {
+	webhookBaseURL := os.Getenv("WEBHOOKS_BASE_URL")
+	if webhookBaseURL == "" {
+		webhookBaseURL = baseURL
+	}
+	return webhookBaseURL
+}
+
+func getRunnerAPIBaseURL(baseURL string) string {
+	runnerAPIBaseURL := os.Getenv("RUNNER_API_BASE_URL")
+	if runnerAPIBaseURL == "" {
+		runnerAPIBaseURL = baseURL
+	}
+	return runnerAPIBaseURL
+}
+
+func newBlobProvider() (blob.Provider, error) {
+	name := strings.TrimSpace(os.Getenv("BLOB_STORAGE_PROVIDER"))
+	if name == "" {
+		return nil, fmt.Errorf("BLOB_STORAGE_PROVIDER is not set")
+	}
+
+	switch name {
+	case blob.ProviderGCS:
+		log.Println("Creating GCS blob storage provider")
+		return gcs.NewProvider()
+	case blob.ProviderS3:
+		log.Println("Creating S3 blob storage provider")
+		return s3blob.NewProvider()
+	case blob.ProviderAzure:
+		log.Println("Creating Azure blob storage provider")
+		return blobazure.NewProvider()
+	case blob.ProviderFilesystem:
+		log.Println("Creating filesystem blob storage provider")
+		return blobfilesystem.NewProvider()
+	default:
+		return nil, fmt.Errorf("unsupported blob storage provider %q", name)
+	}
+}
+
+func newRunnerActiveLogStore() (runnerlogs.Store, error) {
+	if strings.TrimSpace(os.Getenv("RUNNER_ACTIVE_LOG_FS_PATH")) == "" {
+		return nil, nil
+	}
+
+	log.Println("Creating FS runner active log store")
+	return runnerlogsfs.NewProvider()
+}
+
+/*
+ * 8MB is the default maximum response size for HTTP responses.
+ * This prevents component/trigger implementations from using too much memory,
+ * and also from emitting large events.
+ */
+var DefaultMaxHTTPResponseBytes int64 = 8 * 1024 * 1024
