@@ -4,6 +4,8 @@ Run [SuperPlane](https://github.com/superplanehq/superplane) easily with Docker 
 
 The upstream source is stored in [`superplane/`](superplane/) as a Git subtree. The repository root owns the self-hosting Compose stack and build wrapper.
 
+The application build uses `superplane/` as its Docker build context. `Dockerfile.dockerignore` applies build exclusions without modifying the imported subtree.
+
 ## Requirements
 
 - Docker Engine with Docker Compose v2
@@ -101,7 +103,7 @@ git subtree pull \
 
 Replace `main` with a branch or tag when you need a different revision.
 
-After an update, compare upstream `Dockerfile` changes with `Dockerfile.selfhosted`, then run a full image build. The wrapper Dockerfile contains the additional code-generation and local runtime stages required by this stack.
+After an update, compare the upstream `superplane/Dockerfile` with the root `Dockerfile`, then run a full image build. The root Dockerfile contains the additional code-generation and local runtime stages required by this stack.
 
 ## Scope and security
 

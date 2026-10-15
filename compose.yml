@@ -146,7 +146,7 @@ services:
   app:
     build:
       context: ./superplane
-      dockerfile: ../Dockerfile.selfhosted
+      dockerfile: ../Dockerfile
       target: local
     restart: unless-stopped
     environment:
