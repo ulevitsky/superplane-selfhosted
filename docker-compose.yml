@@ -1,0 +1,292 @@
+# Self-hosted SuperPlane stack built only from this repository.
+#
+# Usage:
+#   docker compose up --build
+#
+#   With local Docker runners (executes factory line tasks):
+#   docker compose --profile runners up --build
+#
+# First run: build takes a while (Go modules, npm install, protoc, Vite build).
+# Open http://localhost:8000 and complete owner setup.
+#
+# This stack is not for development on the repo. For development, use
+# `make dev.up && make dev.setup && make dev.server`, which give hot reload.
+
+name: superplane-selfhosted
+
+x-local-env: &local-env
+  # `production` serves the embedded frontend build instead of proxying to a
+  # Vite dev server. This stack is a single-process local deployment, not a
+  # hot-reload dev environment.
+  APP_ENV: production
+  APPLICATION_NAME: superplane
+  BASE_URL: ${BASE_URL:-http://localhost:8000}
+  PUBLIC_API_BASE_PATH: /api/v1
+  WEB_BASE_PATH: ""
+  PUBLIC_API_PORT: "8000"
+  PORT: "8000"
+  API_PORT: "8000"
+  DB_HOST: db
+  DB_PORT: "5432"
+  DB_NAME: superplane_local
+  DB_USERNAME: postgres
+  DB_PASSWORD: ${POSTGRES_PASSWORD:-the-cake-is-a-lie}
+  POSTGRES_DB_SSL: "false"
+  RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+  # Externals (webhooks, runners) reach this app through the host's port 8000.
+  WEBHOOKS_BASE_URL: ${WEBHOOKS_BASE_URL:-http://app:8000}
+  RUNNER_API_BASE_URL: ${RUNNER_API_BASE_URL:-http://app:8000}
+  SWAGGER_BASE_PATH: /app/api/swagger
+  RBAC_MODEL_PATH: /app/rbac/rbac_model.conf
+  RBAC_ORG_POLICY_PATH: /app/rbac/rbac_org_policy.csv
+  TEMPLATE_DIR: /app/templates
+  OIDC_KEYS_PATH: /oidc-keys
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:-1234567890abcdefghijklmnopqrstuv}
+  JWT_SECRET: ${JWT_SECRET:-1234567890abcdefghijklmnopqrstuv}
+  SESSION_SECRET: ${SESSION_SECRET:-1234567890abcdefghijklmnopqrstuv}
+  NO_ENCRYPTION: "yes"
+  OWNER_SETUP_ENABLED: "yes"
+  BLOCK_SIGNUP: "yes"
+  ENABLE_PASSWORD_LOGIN: "yes"
+  START_PUBLIC_API: "yes"
+  START_RUNNER_API: "yes"
+  START_RUNNER_LOG_COMPACTOR: "yes"
+  START_RUNNER_CLEANUP_WORKER: "yes"
+  START_CONSUMERS: "yes"
+  START_WEB_SERVER: "yes"
+  START_WEBSOCKET_SERVER: "yes"
+  START_GRPC_GATEWAY: "yes"
+  START_EVENT_DISTRIBUTER: "yes"
+  START_EVENT_ROUTER: "yes"
+  START_RUN_FINALIZER: "yes"
+  START_RUN_INITIALIZER: "yes"
+  START_NODE_EXECUTOR: "yes"
+  START_EXECUTION_TERMINATOR: "yes"
+  START_NODE_QUEUE_WORKER: "yes"
+  START_NODE_REQUEST_WORKER: "yes"
+  START_APP_MESSAGE_WORKER: "yes"
+  START_INTEGRATION_REQUEST_WORKER: "yes"
+  START_WEBHOOK_PROVISIONER: "yes"
+  START_WEBHOOK_CLEANUP_WORKER: "yes"
+  START_INTEGRATION_CLEANUP_WORKER: "yes"
+  START_CANVAS_CLEANUP_WORKER: "yes"
+  START_NODE_REQUEST_CLEANUP_WORKER: "yes"
+  START_ORGANIZATION_CLEANUP_WORKER: "yes"
+  START_FACTORY_CLEANUP_WORKER: "yes"
+  START_FACTORY_VELOCITY_SYNC_WORKER: "yes"
+  START_PRICE_BOOK_SYNC_WORKER: "yes"
+  START_PLANNING_SESSION_CLEANUP_WORKER: "yes"
+  START_EVENT_RETENTION_WORKER: "yes"
+  START_FILE_CLEANUP_WORKER: "yes"
+  BLOB_STORAGE_PROVIDER: filesystem
+  BLOB_STORAGE_LOCAL_PATH: /var/lib/superplane/blobs
+  BLOB_STORAGE_SIGNING_KEY: local-development-file-signing-key
+  RUNNER_ACTIVE_LOG_FS_PATH: /var/lib/superplane/active-runner-logs
+  ALLOWED_WS_ORIGINS: ${ALLOWED_WS_ORIGINS:-http://localhost:8000}
+  OTEL_ENABLED: "no"
+  PPROF_ENABLED: "no"
+  SUPERPLANE_BEACON_ENABLED: "no"
+  SUPERPLANE_INSTALLATION_TYPE: selfhosted-compose
+
+services:
+  # One-shot: generate the OIDC signing key and prepare the writable volumes
+  # for the `nobody` user the app image runs as.
+  init:
+    image: postgres:17.5
+    restart: "no"
+    volumes:
+      - oidc-keys:/oidc-keys
+      - blob-data:/var/lib/superplane/blobs
+      - active-runner-logs:/var/lib/superplane/active-runner-logs
+    entrypoint:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        if find /oidc-keys -type f -name '*.pem' | grep -q .; then
+          echo "OIDC keys already present."
+        else
+          echo "Generating OIDC signing key..."
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 \
+            -out "/oidc-keys/$$(date -u +%s).pem"
+          # The app container runs as `nobody`, so the key must be world-readable.
+          # The single-host installer uses the same mode.
+          chmod 644 /oidc-keys/*.pem
+          echo "OIDC signing key generated."
+        fi
+        # The app image runs as `nobody` (65534). Named volumes are root-owned.
+        chown -R 65534:65534 /var/lib/superplane/blobs /var/lib/superplane/active-runner-logs
+        echo "Writable volumes are ready."
+
+  db:
+    image: postgres:17.5
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-the-cake-is-a-lie}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3.8.17-management-alpine
+    restart: unless-stopped
+    volumes:
+      - ./superplane/scripts/docker/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./superplane/scripts/docker/rabbitmq-definitions.json:/etc/rabbitmq/definitions.json:ro
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 3s
+      timeout: 3s
+      retries: 5
+
+  app:
+    build:
+      context: ./superplane
+      dockerfile: ../Dockerfile.selfhosted
+      target: local
+    restart: unless-stopped
+    environment:
+      <<: *local-env
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+    volumes:
+      - blob-data:/var/lib/superplane/blobs
+      - active-runner-logs:/var/lib/superplane/active-runner-logs
+      - oidc-keys:/oidc-keys:ro
+    ports:
+      - "${PUBLIC_API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # One-shot: seed the local Docker runner fleet row, the same way
+  # `make dev.setup.runner.fleet` does for the dev stack. Owner setup's
+  # first-run step reuses the row when it already exists.
+  fleet-seed:
+    profiles: [runners]
+    image: postgres:17.5
+    restart: "no"
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-the-cake-is-a-lie}
+    depends_on:
+      app:
+        condition: service_healthy
+    entrypoint:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        psql -h db -p 5432 -U postgres -v ON_ERROR_STOP=1 -d superplane_local <<'SQL'
+        INSERT INTO runner_fleets (
+          id, scope_type, scope_id, slug, enabled, spec, runner_version,
+          created_at, updated_at
+        )
+        VALUES (
+          uuid_generate_v4(),
+          'installation',
+          NULL,
+          'e1-large-amd64',
+          true,
+          jsonb_build_object(
+            'operating_system', 'linux',
+            'architecture', 'amd64',
+            'cpu_millicores', 2000,
+            'memory_mb', 8192,
+            'disk_gb', 30,
+            'capabilities', '[]'::jsonb
+          ),
+          'dev',
+          now(),
+          now()
+        )
+        ON CONFLICT (
+          scope_type,
+          (COALESCE(scope_id, '00000000-0000-0000-0000-000000000000'::uuid)),
+          slug
+        )
+        WHERE deleted_at IS NULL
+        DO UPDATE SET
+          enabled = EXCLUDED.enabled,
+          spec = EXCLUDED.spec,
+          runner_version = EXCLUDED.runner_version,
+          updated_at = EXCLUDED.updated_at;
+        SQL
+        echo "Local runner fleet row is ready."
+
+  # Ephemeral Docker runners. Requires the Docker socket. The local
+  # fleet-manager image mints its installation admin token against the DB
+  # after owner setup finishes, so it can start before setup completes.
+  fleet-manager:
+    profiles: [runners]
+    build:
+      context: ./superplane
+      dockerfile: release/fleet-manager/Dockerfile
+      target: local
+    restart: unless-stopped
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: superplane_local
+      DB_USERNAME: postgres
+      DB_PASSWORD: the-cake-is-a-lie
+      FLEET_MANAGER_CONFIG: |
+        id: local
+        superplaneUrl: http://app:8000
+        installationAdminToken: ""
+        reconciliation:
+          pollTimeout: 30s
+          errorRetryInterval: 2s
+        http:
+          requestTimeout: 60s
+        fleets:
+          - id: e1-large-amd64
+            provider: docker
+            maxCapacity: 10
+            docker:
+              image: superplane-runner-selfhosted:local
+              architecture: amd64
+              runnerApiUrl: http://app:8000
+              network: superplane-selfhosted_default
+              extraHosts:
+                - host.docker.internal:host-gateway
+    depends_on:
+      app:
+        condition: service_started
+      db:
+        condition: service_healthy
+      fleet-seed:
+        condition: service_completed_successfully
+      runner-image:
+        condition: service_completed_successfully
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # Build-only service. fleet-manager starts ephemeral runner containers
+  # from this image when a task is queued. It runs `runner --help` to verify
+  # the image, then exits. fleet-manager depends on its successful completion.
+  runner-image:
+    profiles: [runners]
+    build:
+      context: ./superplane
+      dockerfile: release/runner/Dockerfile
+      target: local
+    image: superplane-runner-selfhosted:local
+    command: ["/usr/local/bin/runner", "--help"]
+
+volumes:
+  postgres-data:
+  oidc-keys:
+  blob-data:
+  active-runner-logs:

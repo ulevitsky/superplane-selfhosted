@@ -1,0 +1,39 @@
+# Keep Docker build contexts small and free of host-local state.
+#
+# Do NOT exclude generated artifacts (pkg/protos, api/swagger, web_src/src/
+# api-client, pkg/web/assets/dist) here. The release image build runs
+# `make pb.gen` on the host first and COPYs those files into the builder
+# stage. The `local` Dockerfile target regenerates them in-image and removes
+# stale copies, so local builds do not depend on them.
+
+# VCS and editor state
+.git
+.gitignore
+.github
+.idea
+.cursor
+.agents
+.claude
+.mcp.json
+.opencode
+.worktrees
+.superpowers
+
+# Secrets and local config (compose interpolates .env, builds never need it)
+.env
+.env.*
+!.env.example
+!.env.multi-instance.example
+
+# Local state and caches
+.local
+tmp
+build
+coverage-go.out
+junit-report.xml
+junit-e2e.xml
+.wrk3-compose.lock
+
+# Host dependencies (all images install what they need in-image)
+web_src/node_modules
+design/node_modules
