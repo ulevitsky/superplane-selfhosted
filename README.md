@@ -1,6 +1,6 @@
-# SuperPlane Self-Hosted
+# SuperPlane self-hosted
 
-Run [SuperPlane](https://github.com/superplanehq/superplane) with Docker Compose. Application and runner images build from the bundled source. This repository does not pull prebuilt SuperPlane images.
+Run [SuperPlane](https://github.com/superplanehq/superplane) easily with Docker Compose. Application and runner images build from the bundled source. This repository does not pull prebuilt SuperPlane images.
 
 The upstream source is stored in [`superplane/`](superplane/) as a Git subtree. The repository root owns the self-hosting Compose stack and build wrapper.
 
@@ -9,7 +9,7 @@ The upstream source is stored in [`superplane/`](superplane/) as a Git subtree. 
 - Docker Engine with Docker Compose v2
 - At least 8 GB of free memory for image builds and local runners
 
-You do not need Go, Node.js, npm, or protoc on the host.
+You do not need anything else on the host.
 
 ## Start SuperPlane
 
